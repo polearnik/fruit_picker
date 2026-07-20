@@ -1,0 +1,6 @@
+/calib_pairs/
+/stereo_calib.npz
+/venv/
+/yolov8n.pt
+/test_frame.jpg
+/.idea/
