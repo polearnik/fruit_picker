@@ -28,6 +28,7 @@ sys.path.insert(0, "arm")
 from stereo_core import StereoRig
 from kinematics import ArmKinematics, JOINT_NAMES
 from handeye import HandEye
+from gripper import close_until_contact
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 LEFT_CAM, RIGHT_CAM = 0, 2
@@ -42,7 +43,9 @@ APPROACH_UP_MM = 40.0                 # насколько подводить В
 GRASP_OFFSET = np.array([-40., 0., -50.]) # x вперед y вбок z вверх поправка к точке захвата (калибровочный сдвиг)
 LIFT_MM = 100.0                       # на сколько поднять после захвата
 GRIPPER_OPEN_DEG = 45.0               # угол раскрытой клешни
-GRIPPER_CLOSED_DEG = 20.0              # угол сжатой клешни (под размер яблока)
+GRIPPER_CLOSED_DEG = 20.0              # ЖЁСТКИЙ ПРЕДЕЛ сжатия: сильнее не сожмём
+                                       # никогда. Реальная остановка — по контакту
+                                       # (см. arm/gripper.py), обычно раньше.
 # --- параметры движения ---
 STEP_DEG, DT, MAX_REL, TOL_MM = 1.0, 0.03, 15.0, 10.0
 GRIP_IDX = JOINT_NAMES.index("gripper")
@@ -160,19 +163,31 @@ def main():
         cur = current.copy()
         open_pre = plan["pre"].copy();   open_pre[GRIP_IDX] = GRIPPER_OPEN_DEG
         open_grasp = plan["grasp"].copy(); open_grasp[GRIP_IDX] = GRIPPER_OPEN_DEG
-        closed_grasp = plan["grasp"].copy(); closed_grasp[GRIP_IDX] = GRIPPER_CLOSED_DEG
-        closed_lift = plan["lift"].copy(); closed_lift[GRIP_IDX] = GRIPPER_CLOSED_DEG
 
         print("1/4 подвожу над яблоком, клешня открыта")
         cur = smooth_to(arm, keys, cur, open_pre)
         print("2/4 опускаюсь к яблоку")
         cur = smooth_to(arm, keys, cur, open_grasp)
-        print("3/4 сжимаю клешню")
-        cur = smooth_to(arm, keys, cur, closed_grasp)
-        time.sleep(0.5)
+
+        print("3/4 сжимаю клешню до контакта с яблоком")
+        # команду шлём только суставу клешни, остальные держатся на месте
+        def send_gripper(angle):
+            arm.send_action({keys["gripper"]: angle})
+
+        grip_deg, reason = close_until_contact(
+            send_gripper, arm.bus,
+            start_deg=GRIPPER_OPEN_DEG, closed_deg=GRIPPER_CLOSED_DEG)
+        cur[GRIP_IDX] = grip_deg
+        if reason == "closed":
+            print("  Клешня сомкнулась вхолостую — яблоко не поймано, не поднимаю.")
+            return
+
+        time.sleep(0.3)
         print("4/4 поднимаю")
+        closed_lift = plan["lift"].copy(); closed_lift[GRIP_IDX] = grip_deg
         cur = smooth_to(arm, keys, cur, closed_lift)
-        print("Готово — яблоко поднято.")
+        time.sleep(5)
+        print(f"Готово — яблоко поднято (клешня держит на {grip_deg:.1f}°).")
     finally:
         arm.disconnect()
         cap_l.release(); cap_r.release()
