@@ -39,7 +39,9 @@ APPLE_CLASS = 47      # класс "apple" в COCO
 CONF = 0.4
 
 # --- параметры захвата (ПОДСТРАИВАЮТСЯ под вашу руку и клешню) ---
-APPROACH_UP_MM = 40.0                 # насколько подводить ВЫШЕ яблока перед спуском
+# Высота, на которой рука ПРОЛЕТАЕТ над яблоком, прежде чем опускаться.
+# Должна быть заметно больше радиуса плода, иначе кончик заденет его боком.
+TRAVEL_CLEARANCE_MM = 90.0
 GRASP_OFFSET = np.array([-40., 0., -50.]) # x вперед y вбок z вверх поправка к точке захвата (калибровочный сдвиг)
 LIFT_MM = 100.0                       # на сколько поднять после захвата
 GRIPPER_OPEN_DEG = 45.0               # угол раскрытой клешни
@@ -48,6 +50,7 @@ GRIPPER_CLOSED_DEG = 20.0              # ЖЁСТКИЙ ПРЕДЕЛ сжати�
                                        # (см. arm/gripper.py), обычно раньше.
 # --- параметры движения ---
 STEP_DEG, DT, MAX_REL, TOL_MM = 1.0, 0.03, 15.0, 10.0
+CART_STEP_MM = 10.0   # шаг разбиения прямой в пространстве (мельче = точнее путь)
 GRIP_IDX = JOINT_NAMES.index("gripper")
 
 
@@ -72,26 +75,80 @@ def detect_apple_cam_xyz(model, fl, fr, rig):
     return best
 
 
-def plan_grasp(kin, handeye, cam_xyz, current_joints):
-    """cam XYZ -> план (углы pre-grasp, grasp, точки, флаг успеха, сообщение)."""
-    target = handeye.cam_to_arm(cam_xyz)
-    grasp_xyz = target + GRASP_OFFSET
-    pre_xyz = grasp_xyz + np.array([0, 0, APPROACH_UP_MM])
-    lift_xyz = grasp_xyz + np.array([0, 0, LIFT_MM])
+def segment_joints(kin, q_start, xyz_from, xyz_to, name, step_mm=CART_STEP_MM):
+    """Прямой отрезок в пространстве -> список углов через каждые step_mm.
 
-    q_pre, e_pre, ok_pre = kin.ik(pre_xyz, current_joints, tol_mm=TOL_MM)
-    q_grasp, e_grasp, ok_grasp = kin.ik(grasp_xyz, q_pre, tol_mm=TOL_MM)
-    q_lift, e_lift, ok_lift = kin.ik(lift_xyz, q_grasp, tol_mm=TOL_MM)
-
-    for name, q, ok, e in [("подвод", q_pre, ok_pre, e_pre),
-                           ("захват", q_grasp, ok_grasp, e_grasp),
-                           ("подъём", q_lift, ok_lift, e_lift)]:
+    Кончик едет по ПРЯМОЙ, а не по дуге: иначе при интерполяции в углах он
+    может проехать сквозь яблоко, даже если конечная точка была над ним.
+    """
+    xyz_from = np.asarray(xyz_from, float)
+    xyz_to = np.asarray(xyz_to, float)
+    dist = float(np.linalg.norm(xyz_to - xyz_from))
+    n = max(1, int(np.ceil(dist / step_mm)))
+    q = np.asarray(q_start, float).copy()
+    out = []
+    for i in range(1, n + 1):
+        p = xyz_from + (xyz_to - xyz_from) * i / n
+        q, err, ok = kin.ik(p, q, tol_mm=TOL_MM)
         if not ok:
-            return None, f"[СТОП] точка '{name}' недостижима (ошибка {e:.0f} мм)"
+            return None, f"[СТОП] '{name}': точка {np.round(p,0)} недостижима ({err:.0f} мм)"
         bad = kin.within_limits(q)
         if bad:
             return None, f"[СТОП] '{name}': сустав за пределом: {[b[0] for b in bad]}"
-    return {"target": target, "pre": q_pre, "grasp": q_grasp, "lift": q_lift}, "ok"
+        out.append(q.copy())
+    return out, "ok"
+
+
+def plan_grasp(kin, handeye, cam_xyz, current_joints):
+    """cam XYZ -> план траектории: подъём, проход над яблоком, спуск, подъём с ним.
+
+    Путь строится по трём прямым отрезкам, чтобы заходить СВЕРХУ:
+      1) от текущей точки вертикально вверх до безопасной высоты;
+      2) горизонтально до точки прямо над яблоком;
+      3) вертикально вниз к яблоку.
+    """
+    target = handeye.cam_to_arm(cam_xyz)
+    grasp_xyz = target + GRASP_OFFSET
+    lift_xyz = grasp_xyz + np.array([0, 0, LIFT_MM])
+
+    # Физический ход суставов шире модельного (URDF), поэтому рука может стоять
+    # в позе, которой в модели «не существует». Планируем от зажатой в пределы
+    # позы — первым движением сустав вернётся в допустимый диапазон.
+    current_joints = np.asarray(current_joints, float)
+    clamped = kin.clamp_to_limits(current_joints)
+    moved = [n for n, a, b in zip(JOINT_NAMES, current_joints, clamped)
+             if abs(a - b) > 0.1]
+    if moved:
+        print(f"  (стартовая поза вне пределов модели по {moved} — "
+              "сначала верну сустав(ы) в рабочий диапазон)")
+    current_joints = clamped
+
+    start_xyz = kin.fk(current_joints)
+    # высота пролёта: заведомо выше яблока, и не ниже текущего положения кончика
+    safe_z = max(grasp_xyz[2] + TRAVEL_CLEARANCE_MM, start_xyz[2])
+    up_xyz = np.array([start_xyz[0], start_xyz[1], safe_z])
+    over_xyz = np.array([grasp_xyz[0], grasp_xyz[1], safe_z])
+
+    segments = [("подъём на безопасную высоту", start_xyz, up_xyz),
+                ("проход над яблоком", up_xyz, over_xyz),
+                ("спуск к яблоку", over_xyz, grasp_xyz)]
+
+    q = np.asarray(current_joints, float).copy()
+    approach = []
+    for name, a, b in segments:
+        part, msg = segment_joints(kin, q, a, b, name)
+        if part is None:
+            return None, msg
+        approach.extend(part)
+        q = part[-1]
+
+    # путь подъёма с яблоком — тоже прямой, вертикально вверх
+    lift_path, msg = segment_joints(kin, q, grasp_xyz, lift_xyz, "подъём с яблоком")
+    if lift_path is None:
+        return None, msg
+
+    return {"target": target, "grasp_xyz": grasp_xyz,
+            "approach": approach, "lift": lift_path}, "ok"
 
 
 def smooth_to(arm, keys, current, goal):
@@ -101,6 +158,17 @@ def smooth_to(arm, keys, current, goal):
         arm.send_action({keys[j]: q[k] for k, j in enumerate(JOINT_NAMES)})
         time.sleep(DT)
     return goal.copy()
+
+
+def follow_path(arm, keys, current, path, grip_deg=None):
+    """Проходит список углов траектории, плавно между соседними точками."""
+    cur = np.asarray(current, float).copy()
+    for q in path:
+        goal = q.copy()
+        if grip_deg is not None:
+            goal[GRIP_IDX] = grip_deg   # клешню держим на своём угле
+        cur = smooth_to(arm, keys, cur, goal)
+    return cur
 
 
 def read_joints(arm, keys):
@@ -152,7 +220,8 @@ def main():
                 print("  должно быть видно обеим камерам).")
             else:
                 print("  Точка в пределах вылета, но неудобна по высоте/направлению —")
-                print("  попробуйте сдвинуть яблоко или уменьшить APPROACH_UP_MM.")
+                print("  попробуйте сдвинуть яблоко или уменьшить TRAVEL_CLEARANCE_MM")
+                print("  (рука может не дотягиваться на высоте пролёта).")
             return
         # ans = input("Выполнить захват? Смотрите на руку. [y/N] ").strip().lower()
         # if ans != "y":
@@ -161,15 +230,11 @@ def main():
 
         # последовательность захвата
         cur = current.copy()
-        open_pre = plan["pre"].copy();   open_pre[GRIP_IDX] = GRIPPER_OPEN_DEG
-        open_grasp = plan["grasp"].copy(); open_grasp[GRIP_IDX] = GRIPPER_OPEN_DEG
 
-        print("1/4 подвожу над яблоком, клешня открыта")
-        cur = smooth_to(arm, keys, cur, open_pre)
-        print("2/4 опускаюсь к яблоку")
-        cur = smooth_to(arm, keys, cur, open_grasp)
+        print("1/3 иду к яблоку сверху (вверх -> над яблоком -> вниз), клешня открыта")
+        cur = follow_path(arm, keys, cur, plan["approach"], grip_deg=GRIPPER_OPEN_DEG)
 
-        print("3/4 сжимаю клешню до контакта с яблоком")
+        print("2/3 сжимаю клешню до контакта с яблоком")
         # команду шлём только суставу клешни, остальные держатся на месте
         def send_gripper(angle):
             arm.send_action({keys["gripper"]: angle})
@@ -183,9 +248,8 @@ def main():
             return
 
         time.sleep(0.3)
-        print("4/4 поднимаю")
-        closed_lift = plan["lift"].copy(); closed_lift[GRIP_IDX] = grip_deg
-        cur = smooth_to(arm, keys, cur, closed_lift)
+        print("3/3 поднимаю")
+        cur = follow_path(arm, keys, cur, plan["lift"], grip_deg=grip_deg)
         time.sleep(5)
         print(f"Готово — яблоко поднято (клешня держит на {grip_deg:.1f}°).")
     finally:
