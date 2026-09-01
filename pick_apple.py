@@ -48,6 +48,11 @@ GRIPPER_OPEN_DEG = 45.0               # угол раскрытой клешни
 GRIPPER_CLOSED_DEG = 20.0              # ЖЁСТКИЙ ПРЕДЕЛ сжатия: сильнее не сожмём
                                        # никогда. Реальная остановка — по контакту
                                        # (см. arm/gripper.py), обычно раньше.
+# Исходная («домашняя») поза: рука вытянута вперёд, все суставы с запасом ~55°
+# до пределов. Из сложенной позы, где суставы упёрты в механические концы,
+# планировать нельзя — сначала приводим руку сюда.
+HOME_JOINTS = np.array([0., -30., 40., -20., 0., 45.])
+
 # --- параметры движения ---
 STEP_DEG, DT, MAX_REL, TOL_MM = 1.0, 0.03, 15.0, 10.0
 CART_STEP_MM = 10.0   # шаг разбиения прямой в пространстве (мельче = точнее путь)
@@ -176,6 +181,18 @@ def read_joints(arm, keys):
     return np.array([obs[keys[j]] for j in JOINT_NAMES], dtype=float)
 
 
+def go_home(arm, keys, current, slow=0.06):
+    """Приводит руку в исходную позу. Медленно: из сложенной позы ход большой."""
+    delta = np.max(np.abs(HOME_JOINTS - current))
+    print(f"Иду в исходную позу (максимальный ход сустава {delta:.0f}°)...")
+    n = max(1, int(delta / STEP_DEG))
+    for i in range(1, n + 1):
+        q = current + (HOME_JOINTS - current) * i / n
+        arm.send_action({keys[j]: q[k] for k, j in enumerate(JOINT_NAMES)})
+        time.sleep(slow)
+    return HOME_JOINTS.copy()
+
+
 def main():
     rig = StereoRig("stereo_calib.npz")
     kin = ArmKinematics()
@@ -192,6 +209,14 @@ def main():
         keys = {j: next(k for k in arm.get_observation()
                         if j in k and isinstance(arm.get_observation()[k], (int, float)))
                 for j in JOINT_NAMES}
+
+        # Из сложенной позы (суставы в механическом упоре) планировать нельзя —
+        # сначала разворачиваем руку в известное исходное положение.
+        start_pose = read_joints(arm, keys)
+        out_of_model = kin.within_limits(start_pose)
+        if out_of_model:
+            print(f"Рука сложена: суставы {[b[0] for b in out_of_model]} в упоре.")
+        go_home(arm, keys, start_pose)
 
         print("Ищу яблоко... покажите его обеим камерам.")
         cam_xyz = None

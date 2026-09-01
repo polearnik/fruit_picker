@@ -24,12 +24,22 @@ JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex",
 TARGET_FRAME = "gripper_frame_link"
 URDF_PATH = Path(__file__).parent / "urdf" / "so101_new_calib.urdf"
 
+# Шаг времени решателя. Нужен, чтобы placo соблюдал пределы суставов;
+# на результат IK не влияет, задаёт лишь темп сходимости за итерацию.
+SOLVER_DT = 0.05
+
 
 class ArmKinematics:
     def __init__(self, urdf_path=URDF_PATH):
         self._kin = RobotKinematics(str(urdf_path), TARGET_FRAME, JOINT_NAMES)
         self.joint_names = JOINT_NAMES
         self.limits_deg = self._read_limits(urdf_path)  # {сустав: (мин, макс)} в градусах
+
+        # Задача «попади в точку» задаёт 3 координаты, а свободных суставов 4 —
+        # лишняя степень свободы позволяла решателю уводить wrist_flex за предел.
+        # Просим placo самому соблюдать пределы из URDF (нужен заданный dt).
+        self._kin.solver.dt = SOLVER_DT
+        self._kin.solver.enable_joint_limits(True)
 
     @staticmethod
     def _read_limits(urdf_path):
@@ -42,8 +52,28 @@ class ArmKinematics:
                                          np.rad2deg(float(lim.get("upper"))))
         return limits
 
-    def within_limits(self, joints_deg, margin_deg=2.0):
-        """Список суставов, вышедших за пределы URDF (с запасом margin). Пусто = всё ок."""
+    def clamp_to_limits(self, joints_deg, margin_deg=2.5):
+        """Загоняет углы в пределы URDF.
+
+        Физический диапазон руки ШИРЕ модельного (калибровка lerobot считает
+        градусы от середины реального хода). Если сустав припаркован за пределом
+        модели, планировать от такой позы нельзя — зажимаем её в допустимую.
+        """
+        q = np.asarray(joints_deg, dtype=float).copy()
+        for i, name in enumerate(self.joint_names):
+            if name in self.limits_deg:
+                lo, hi = self.limits_deg[name]
+                q[i] = float(np.clip(q[i], lo + margin_deg, hi - margin_deg))
+        return q
+
+    def within_limits(self, joints_deg, margin_deg=0.0):
+        """Список суставов, вышедших за пределы URDF (с запасом margin). Пусто = всё ок.
+
+        Запас по умолчанию нулевой: пределы соблюдает сам решатель (см.
+        enable_joint_limits в __init__), причём он законно прижимает сустав
+        вплотную к пределу. Это лишь контрольная проверка; ненулевой запас
+        забраковал бы такие корректные траектории.
+        """
         bad = []
         for name, val in zip(self.joint_names, np.asarray(joints_deg, dtype=float)):
             if name in self.limits_deg:
