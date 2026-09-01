@@ -19,9 +19,9 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-LEFT_CAM = 2    # те же индексы, что в stereo_capture.py
-RIGHT_CAM = 0
-FRAME_W, FRAME_H = 640, 480
+LEFT_CAM = 0    # те же индексы, что в stereo_capture.py
+RIGHT_CAM = 2
+FRAME_W, FRAME_H = 1280, 960
 
 FRUIT_CLASSES = {46: "banana", 47: "apple", 49: "orange"}
 CONFIDENCE = 0.4
