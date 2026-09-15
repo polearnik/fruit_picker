@@ -9,7 +9,8 @@
 Пайплайн:
   YOLO находит яблоко в левом+правом кадре -> триангуляция -> XYZ в системе камеры
   -> hand-eye -> XYZ в системе руки -> IK -> движение:
-  открыть клешню -> подвести НАД яблоком -> опуститься -> сжать -> поднять.
+  открыть клешню -> подвести НАД яблоком -> опуститься -> сжать -> поднять
+  -> перенести над ящиком -> разжать (яблоко падает в ящик) -> уйти вверх -> домой.
 
 ВНИМАНИЕ: первый реальный захват требует подстройки (GRASP_OFFSET, углы клешни).
 Рука в свободном пространстве, выключатель под рукой, смотрите на движение.
@@ -44,20 +45,51 @@ CONF = 0.4
 # Высота, на которой рука ПРОЛЕТАЕТ над яблоком, прежде чем опускаться.
 # Должна быть заметно больше радиуса плода, иначе кончик заденет его боком.
 TRAVEL_CLEARANCE_MM = 90.0
-GRASP_OFFSET = np.array([-40., 0., 20.]) # x вперед y вбок z вверх поправка к точке захвата (калибровочный сдвиг)
+# Поправка к точке захвата: куда встать КОНЧИКУ относительно яблока.
+# Оси — НЕ основания, а направления вылета на яблоко (см. reach_frame):
+#   X: вдоль вылета   + дальше от основания / - ближе к основанию
+#   Y: поперёк вылета + влево от направления на яблоко / - вправо
+#   Z: вверх          + выше яблока / - ниже
+# Так и надо: смещение компенсирует геометрию клешни (центр хвата вынесен
+# от gripper_frame_link примерно на 45 мм), а она поворачивается вместе с
+# рукой. В осях основания то же смещение пришлось бы перенастраивать под
+# каждое положение яблока.
+GRASP_OFFSET = np.array([0., -10., -15.])
 LIFT_MM = 100.0                       # на сколько поднять после захвата
-GRIPPER_OPEN_DEG = 45.0               # угол раскрытой клешни
-GRIPPER_CLOSED_DEG = 20.0              # ЖЁСТКИЙ ПРЕДЕЛ сжатия: сильнее не сожмём
+GRIPPER_OPEN_DEG = 95.0               # угол раскрытой клешни
+GRIPPER_CLOSED_DEG = 10.0              # ЖЁСТКИЙ ПРЕДЕЛ сжатия: сильнее не сожмём
                                        # никогда. Реальная остановка — по контакту
                                        # (см. arm/gripper.py), обычно раньше.
+
+# --- точка сброса в ящик (СНИМАЕТСЯ РУКОЙ, не рулеткой) ---
+# Положение КОНЧИКА (кадр gripper_frame_link), при котором разжатая клешня
+# роняет яблоко в ящик. Это НЕ «край ящика» и НЕ «центр ящика»: яблоко висит в
+# клешне ниже и позади кончика (см. GRASP_OFFSET), поэтому пересчитывать высоту
+# в уме бесполезно — точку надо снять той же FK, которой считает планировщик:
+#     python arm/teach_point.py     (вложить яблоко, подвести рукой, Enter)
+# Снимайте так, чтобы яблоко было по центру ящика и лишь чуть выше его края:
+# каждый лишний сантиметр высоты — это отскок и промах мимо ящика.
+# Значение ниже — точка, промеренная рулеткой в первом заезде; переснимите её.
+RELEASE_XYZ = np.array([189.5, 315.3, -128.2])
+CARRY_CLEARANCE_MM = 120.0  # высота пролёта над ящиком по пути к нему
+RETREAT_MM = 70.0           # уйти вверх после того, как отпустили яблоко
 # Исходная («домашняя») поза: рука вытянута вперёд, все суставы с запасом ~55°
 # до пределов. Из сложенной позы, где суставы упёрты в механические концы,
 # планировать нельзя — сначала приводим руку сюда.
 HOME_JOINTS = np.array([0., -30., 40., -20., 0., 45.])
 
-# --- параметры движения ---
-STEP_DEG, DT, MAX_REL, TOL_MM = 1.0, 0.03, 15.0, 10.0
-CART_STEP_MM = 10.0   # шаг разбиения прямой в пространстве (мельче = точнее путь)
+# --- параметры движения (ЗДЕСЬ КРУТИТСЯ СКОРОСТЬ) ---
+# Темп задаёт пара «шаг/пауза»: STEP_DEG градусов за DT секунд, то есть
+# STEP_DEG/DT градусов в секунду. Но на траектории соседние точки отстоят на
+# CART_STEP_MM, и поворот сустава между ними обычно МЕНЬШЕ градуса — тогда шаг
+# всего один, и STEP_DEG ни на что не влияет. Реальный пол скорости на
+# траектории — это DT на каждую точку, поэтому ускоряют так:
+#   DT меньше              — чаще шлём команды (следите за отставанием серв);
+#   CART_STEP_TRAVEL больше — меньше точек на том же пути.
+# STEP_DEG работает там, где ход большой: go_home и первый заход в позу.
+STEP_DEG, DT, MAX_REL, TOL_MM = 5.0, 0.03, 15.0, 10.0
+CART_STEP_MM = 10.0          # рядом с плодом и в ящике: точность важнее скорости
+CART_STEP_TRAVEL_MM = 25.0   # в свободном пространстве: грубее и быстрее
 GRIP_IDX = JOINT_NAMES.index("gripper")
 
 
@@ -106,6 +138,20 @@ def segment_joints(kin, q_start, xyz_from, xyz_to, name, step_mm=CART_STEP_MM):
     return out, "ok"
 
 
+def reach_frame(target_xyz):
+    """Оси «вдоль вылета / поперёк / вверх» для точки target (в системе основания).
+
+    Рука тянется к яблоку под азимутом yaw, и клешня развёрнута туда же. Значит
+    поправка на геометрию клешни должна поворачиваться вместе с ней, иначе она
+    верна только для одного положения плода.
+    """
+    yaw = np.arctan2(target_xyz[1], target_xyz[0])
+    c, s = np.cos(yaw), np.sin(yaw)
+    return np.array([[c, -s, 0.],
+                     [s,  c, 0.],
+                     [0., 0., 1.]])
+
+
 def plan_grasp(kin, handeye, cam_xyz, current_joints):
     """cam XYZ -> план траектории: подъём, проход над яблоком, спуск, подъём с ним.
 
@@ -115,7 +161,10 @@ def plan_grasp(kin, handeye, cam_xyz, current_joints):
       3) вертикально вниз к яблоку.
     """
     target = handeye.cam_to_arm(cam_xyz)
-    grasp_xyz = target + GRASP_OFFSET
+    offset_base = reach_frame(target) @ GRASP_OFFSET
+    grasp_xyz = target + offset_base
+    print(f"  поправка захвата {GRASP_OFFSET} (вылет/поперёк/вверх) "
+          f"-> {np.round(offset_base, 1)} в осях основания")
     lift_xyz = grasp_xyz + np.array([0, 0, LIFT_MM])
 
     # Физический ход суставов шире модельного (URDF), поэтому рука может стоять
@@ -136,14 +185,15 @@ def plan_grasp(kin, handeye, cam_xyz, current_joints):
     up_xyz = np.array([start_xyz[0], start_xyz[1], safe_z])
     over_xyz = np.array([grasp_xyz[0], grasp_xyz[1], safe_z])
 
-    segments = [("подъём на безопасную высоту", start_xyz, up_xyz),
-                ("проход над яблоком", up_xyz, over_xyz),
-                ("спуск к яблоку", over_xyz, grasp_xyz)]
+    # в свободном пространстве едем грубыми шагами, у самого яблока — мелкими
+    segments = [("подъём на безопасную высоту", start_xyz, up_xyz, CART_STEP_TRAVEL_MM),
+                ("проход над яблоком", up_xyz, over_xyz, CART_STEP_TRAVEL_MM),
+                ("спуск к яблоку", over_xyz, grasp_xyz, CART_STEP_MM)]
 
     q = np.asarray(current_joints, float).copy()
     approach = []
-    for name, a, b in segments:
-        part, msg = segment_joints(kin, q, a, b, name)
+    for name, a, b, step in segments:
+        part, msg = segment_joints(kin, q, a, b, name, step_mm=step)
         if part is None:
             return None, msg
         approach.extend(part)
@@ -156,6 +206,45 @@ def plan_grasp(kin, handeye, cam_xyz, current_joints):
 
     return {"target": target, "grasp_xyz": grasp_xyz,
             "approach": approach, "lift": lift_path}, "ok"
+
+
+def plan_place(kin, q_start, start_xyz, release_xyz=RELEASE_XYZ):
+    """План переноса яблока в ящик и отхода после сброса.
+
+    Тот же принцип, что и у захвата: тремя прямыми отрезками сверху, чтобы
+    яблоко в клешне не задевало край ящика по дороге.
+      1) вертикально вверх до высоты пролёта над ящиком;
+      2) горизонтально до точки прямо над ящиком;
+      3) вертикально вниз до точки сброса.
+    """
+    release_xyz = np.asarray(release_xyz, float)
+    retreat_xyz = release_xyz + np.array([0, 0, RETREAT_MM])
+
+    start_xyz = np.asarray(start_xyz, float)
+    safe_z = max(release_xyz[2] + CARRY_CLEARANCE_MM, start_xyz[2])
+    up_xyz = np.array([start_xyz[0], start_xyz[1], safe_z])
+    over_xyz = np.array([release_xyz[0], release_xyz[1], safe_z])
+
+    segments = [("подъём на высоту переноса", start_xyz, up_xyz, CART_STEP_TRAVEL_MM),
+                ("перенос к ящику", up_xyz, over_xyz, CART_STEP_TRAVEL_MM),
+                ("спуск в ящик", over_xyz, release_xyz, CART_STEP_MM)]
+
+    q = np.asarray(q_start, float).copy()
+    carry = []
+    for name, a, b, step in segments:
+        part, msg = segment_joints(kin, q, a, b, name, step_mm=step)
+        if part is None:
+            return None, msg
+        carry.extend(part)
+        q = part[-1]
+
+    # отход вверх уже с пустой клешнёй — чтобы не зацепить сброшенный плод
+    retreat, msg = segment_joints(kin, q, release_xyz, retreat_xyz, "отход от ящика",
+                                  step_mm=CART_STEP_TRAVEL_MM)
+    if retreat is None:
+        return None, msg
+
+    return {"release_xyz": release_xyz, "carry": carry, "retreat": retreat}, "ok"
 
 
 def smooth_to(arm, keys, current, goal):
@@ -177,8 +266,11 @@ def follow_path(arm, keys, current, path, grip_deg=None,
             goal[GRIP_IDX] = grip_deg   # клешню держим на своём угле
         cur = smooth_to(arm, keys, cur, goal)
         if log is not None:
+            # кадр читаем, только если логгер его действительно запишет:
+            # два cap.read() стоят ~100 мс и раньше платились на КАЖДОЙ точке
+            frames = grab_frames(cams) if log.wants_frame() else None
             log.tick(phase, joints=cur, tip_xyz=kin.fk(cur) if kin else None,
-                     frames=grab_frames(cams), bus=arm.bus)
+                     frames=frames, bus=arm.bus)
     return cur
 
 
@@ -229,7 +321,9 @@ def main():
     log = EpisodeLogger(extra_sensors=None)
     log.set_meta(grasp_offset=GRASP_OFFSET, travel_clearance_mm=TRAVEL_CLEARANCE_MM,
                  lift_mm=LIFT_MM, gripper_open_deg=GRIPPER_OPEN_DEG,
-                 gripper_limit_deg=GRIPPER_CLOSED_DEG, model="yolov8n.pt")
+                 gripper_limit_deg=GRIPPER_CLOSED_DEG, model="yolov8n.pt",
+                 release_xyz=RELEASE_XYZ,
+                 carry_clearance_mm=CARRY_CLEARANCE_MM)
     success, note = False, "прервано"
     try:
         keys = {j: next(k for k in arm.get_observation()
@@ -289,11 +383,11 @@ def main():
         # последовательность захвата
         cur = current.copy()
 
-        print("1/3 иду к яблоку сверху (вверх -> над яблоком -> вниз), клешня открыта")
+        print("1/5 иду к яблоку сверху (вверх -> над яблоком -> вниз), клешня открыта")
         cur = follow_path(arm, keys, cur, plan["approach"], grip_deg=GRIPPER_OPEN_DEG,
                           log=log, phase="approach", kin=kin, cams=cams)
 
-        print("2/3 сжимаю клешню до контакта с яблоком")
+        print("2/5 сжимаю клешню до контакта с яблоком")
         # команду шлём только суставу клешни, остальные держатся на месте
         def send_gripper(angle):
             arm.send_action({keys["gripper"]: angle})
@@ -311,14 +405,51 @@ def main():
             return
 
         time.sleep(0.3)
-        print("3/3 поднимаю")
+        print("3/5 поднимаю")
         cur = follow_path(arm, keys, cur, plan["lift"], grip_deg=grip_deg,
                           log=log, phase="lift", kin=kin, cams=cams)
         log.tick("lifted", joints=cur, tip_xyz=kin.fk(cur),
                  frames=grab_frames(cams), bus=arm.bus, force=True)
-        time.sleep(5)
-        print(f"Готово — яблоко поднято (клешня держит на {grip_deg:.1f}°).")
-        success, note = True, f"взято, клешня {grip_deg:.1f}°"
+
+        print("4/5 несу к ящику")
+        # Высота сброса относительно высоты захвата — то, что видно глазом при
+        # промахе «яблоко выпало слишком высоко». Печатаем ДО движения.
+        drop_above_grasp = RELEASE_XYZ[2] - plan["grasp_xyz"][2]
+        print(f"  точка сброса {np.round(RELEASE_XYZ, 1)} мм — по высоте это "
+              f"{drop_above_grasp:+.0f} мм")
+        print("  относительно точки захвата (переснять: python arm/teach_point.py)")
+        place, msg = plan_place(kin, cur, kin.fk(cur))
+        if place is None:
+            print(msg)
+            print("  До точки сброса рука не дотягивается: подвиньте ящик ближе")
+            print("  или переснимите точку (arm/teach_point.py).")
+            print("  Яблоко осталось в клешне.")
+            log.event("place_failed", reason=msg, release_xyz=RELEASE_XYZ)
+            note = f"взято, но до точки сброса не дотянуться: {msg}"
+            return
+        cur = follow_path(arm, keys, cur, place["carry"], grip_deg=grip_deg,
+                          log=log, phase="carry", kin=kin, cams=cams)
+        log.tick("over_box", joints=cur, tip_xyz=kin.fk(cur),
+                 frames=grab_frames(cams), bus=arm.bus, force=True)
+
+        print("5/5 разжимаю клешню — яблоко падает в ящик")
+        # клешню открываем плавно, остальные суставы стоят на месте
+        goal = cur.copy()
+        goal[GRIP_IDX] = GRIPPER_OPEN_DEG
+        cur = smooth_to(arm, keys, cur, goal)
+        log.event("release", gripper_deg=GRIPPER_OPEN_DEG,
+                  release_xyz=place["release_xyz"])
+        time.sleep(0.5)
+        log.tick("released", joints=cur, tip_xyz=kin.fk(cur),
+                 frames=grab_frames(cams), bus=arm.bus, force=True)
+
+        # отходим вверх с открытой клешнёй, чтобы не задеть сброшенный плод
+        cur = follow_path(arm, keys, cur, place["retreat"],
+                          grip_deg=GRIPPER_OPEN_DEG,
+                          log=log, phase="retreat", kin=kin, cams=cams)
+        cur = go_home(arm, keys, cur)
+        print("Готово — яблоко в ящике, рука в исходной позе.")
+        success, note = True, "яблоко сложено в ящик"
     finally:
         log.finish(success, note)
         arm.disconnect()

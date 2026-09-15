@@ -97,6 +97,14 @@ class EpisodeLogger:
 
     # ---------- запись ----------
 
+    def wants_frame(self):
+        """Нужен ли кадр на этом такте (кадры пишутся по таймеру, а не подряд).
+
+        Чтение камеры стоит десятки миллисекунд, а tick() зовётся на каждой точке
+        траектории — поэтому спрашиваем ЗАРАНЕЕ и не читаем кадр впустую.
+        """
+        return self.save_frames and (self.t - self._last_frame_t >= self.frame_every)
+
     def tick(self, phase, joints=None, tip_xyz=None, frames=None,
              bus=None, extra=None, force=False):
         """Одна запись состояния. Кадры и телеметрия — по таймеру (или force=True)."""
