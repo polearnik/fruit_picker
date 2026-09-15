@@ -29,6 +29,8 @@ from stereo_core import StereoRig
 from kinematics import ArmKinematics, JOINT_NAMES
 from handeye import HandEye
 from gripper import close_until_contact
+sys.path.insert(0, ".")
+from episode_logger import EpisodeLogger
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 LEFT_CAM, RIGHT_CAM = 0, 2
@@ -42,7 +44,7 @@ CONF = 0.4
 # Высота, на которой рука ПРОЛЕТАЕТ над яблоком, прежде чем опускаться.
 # Должна быть заметно больше радиуса плода, иначе кончик заденет его боком.
 TRAVEL_CLEARANCE_MM = 90.0
-GRASP_OFFSET = np.array([-40., 0., -50.]) # x вперед y вбок z вверх поправка к точке захвата (калибровочный сдвиг)
+GRASP_OFFSET = np.array([-40., 0., 20.]) # x вперед y вбок z вверх поправка к точке захвата (калибровочный сдвиг)
 LIFT_MM = 100.0                       # на сколько поднять после захвата
 GRIPPER_OPEN_DEG = 45.0               # угол раскрытой клешни
 GRIPPER_CLOSED_DEG = 20.0              # ЖЁСТКИЙ ПРЕДЕЛ сжатия: сильнее не сожмём
@@ -165,7 +167,8 @@ def smooth_to(arm, keys, current, goal):
     return goal.copy()
 
 
-def follow_path(arm, keys, current, path, grip_deg=None):
+def follow_path(arm, keys, current, path, grip_deg=None,
+                log=None, phase="", kin=None, cams=None):
     """Проходит список углов траектории, плавно между соседними точками."""
     cur = np.asarray(current, float).copy()
     for q in path:
@@ -173,7 +176,21 @@ def follow_path(arm, keys, current, path, grip_deg=None):
         if grip_deg is not None:
             goal[GRIP_IDX] = grip_deg   # клешню держим на своём угле
         cur = smooth_to(arm, keys, cur, goal)
+        if log is not None:
+            log.tick(phase, joints=cur, tip_xyz=kin.fk(cur) if kin else None,
+                     frames=grab_frames(cams), bus=arm.bus)
     return cur
+
+
+def grab_frames(cams):
+    """Кадры с обеих камер для записи эпизода (None, если камеры не переданы)."""
+    if not cams:
+        return None
+    out = {}
+    for name, cap in cams.items():
+        ok, img = cap.read()
+        out[name] = img if ok else None
+    return out
 
 
 def read_joints(arm, keys):
@@ -205,6 +222,15 @@ def main():
     arm = SO101Follower(SO101FollowerConfig(port=PORT, id=ROBOT_ID,
                                             use_degrees=True, max_relative_target=MAX_REL))
     arm.connect(calibrate=False)
+
+    cams = {"left": cap_l, "right": cap_r}
+    # Запись эпизода: кадры, углы, телеметрия, свои датчики. Чтобы добавить свой
+    # датчик — передайте extra_sensors=функция, возвращающая словарь значений.
+    log = EpisodeLogger(extra_sensors=None)
+    log.set_meta(grasp_offset=GRASP_OFFSET, travel_clearance_mm=TRAVEL_CLEARANCE_MM,
+                 lift_mm=LIFT_MM, gripper_open_deg=GRIPPER_OPEN_DEG,
+                 gripper_limit_deg=GRIPPER_CLOSED_DEG, model="yolov8n.pt")
+    success, note = False, "прервано"
     try:
         keys = {j: next(k for k in arm.get_observation()
                         if j in k and isinstance(arm.get_observation()[k], (int, float)))
@@ -228,12 +254,17 @@ def main():
             cv2.imshow("pick (нажмите q для отмены)", cv2.hconcat(
                 [cv2.resize(fl, (640, 480)), cv2.resize(fr, (640, 480))]))
             if cv2.waitKey(1) & 0xFF == ord("q"):
+                note = "отменено пользователем"
                 return
         print(f"Яблоко в системе камеры: {np.round(cam_xyz,1)} мм")
         target_arm = handeye.cam_to_arm(cam_xyz)
         dist = float(np.linalg.norm(target_arm))
         print(f"Яблоко в системе руки: {np.round(target_arm,1)} мм, "
               f"расстояние от основания {dist:.0f} мм")
+        # кадры момента обнаружения — самые ценные для обучения детектора
+        log.set_meta(apple_cam_xyz=cam_xyz, apple_arm_xyz=target_arm, distance_mm=dist)
+        log.tick("detected", joints=read_joints(arm, keys), tip_xyz=None,
+                 frames={"left": fl, "right": fr}, bus=arm.bus, force=True)
 
         current = read_joints(arm, keys)
         plan, msg = plan_grasp(kin, handeye, cam_xyz, current)
@@ -247,6 +278,8 @@ def main():
                 print("  Точка в пределах вылета, но неудобна по высоте/направлению —")
                 print("  попробуйте сдвинуть яблоко или уменьшить TRAVEL_CLEARANCE_MM")
                 print("  (рука может не дотягиваться на высоте пролёта).")
+            log.event("plan_failed", reason=msg, distance_mm=dist)
+            note = f"планирование не прошло: {msg}"
             return
         # ans = input("Выполнить захват? Смотрите на руку. [y/N] ").strip().lower()
         # if ans != "y":
@@ -257,7 +290,8 @@ def main():
         cur = current.copy()
 
         print("1/3 иду к яблоку сверху (вверх -> над яблоком -> вниз), клешня открыта")
-        cur = follow_path(arm, keys, cur, plan["approach"], grip_deg=GRIPPER_OPEN_DEG)
+        cur = follow_path(arm, keys, cur, plan["approach"], grip_deg=GRIPPER_OPEN_DEG,
+                          log=log, phase="approach", kin=kin, cams=cams)
 
         print("2/3 сжимаю клешню до контакта с яблоком")
         # команду шлём только суставу клешни, остальные держатся на месте
@@ -268,16 +302,25 @@ def main():
             send_gripper, arm.bus,
             start_deg=GRIPPER_OPEN_DEG, closed_deg=GRIPPER_CLOSED_DEG)
         cur[GRIP_IDX] = grip_deg
+        log.event("grasp", reason=reason, gripper_deg=grip_deg)
+        log.tick("grasped", joints=cur, tip_xyz=kin.fk(cur),
+                 frames=grab_frames(cams), bus=arm.bus, force=True)
         if reason == "closed":
             print("  Клешня сомкнулась вхолостую — яблоко не поймано, не поднимаю.")
+            note = "клешня сомкнулась вхолостую"
             return
 
         time.sleep(0.3)
         print("3/3 поднимаю")
-        cur = follow_path(arm, keys, cur, plan["lift"], grip_deg=grip_deg)
+        cur = follow_path(arm, keys, cur, plan["lift"], grip_deg=grip_deg,
+                          log=log, phase="lift", kin=kin, cams=cams)
+        log.tick("lifted", joints=cur, tip_xyz=kin.fk(cur),
+                 frames=grab_frames(cams), bus=arm.bus, force=True)
         time.sleep(5)
         print(f"Готово — яблоко поднято (клешня держит на {grip_deg:.1f}°).")
+        success, note = True, f"взято, клешня {grip_deg:.1f}°"
     finally:
+        log.finish(success, note)
         arm.disconnect()
         cap_l.release(); cap_r.release()
         cv2.destroyAllWindows()
