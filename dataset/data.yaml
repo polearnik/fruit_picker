@@ -1,0 +1,12 @@
+# Конфиг датасета для обучения YOLO.
+# ЕДИНЫЙ источник списка классов — его читают autolabel.py, label_tool.py и train.py.
+# Хотите другие ягоды — меняете только names здесь (и prompts в autolabel.py при желании).
+
+path: .              # заполняется автоматически при запуске train.py
+train: train.txt     # списки картинок формируются autolabel.py при разметке
+val: val.txt
+
+names:
+  0: strawberry
+  1: raspberry
+  2: cherry
