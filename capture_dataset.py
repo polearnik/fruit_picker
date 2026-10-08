@@ -16,8 +16,9 @@ from pathlib import Path
 
 import cv2
 
+from camera import open_cam, preview
+
 CAM = 0                 # обычная одна камера; для датасета стерео не нужно
-FRAME_W, FRAME_H = 640, 480
 AUTO_EVERY = 0.7        # секунд между кадрами в режиме автосъёмки
 
 OUT_DIR = Path("dataset/images")
@@ -25,11 +26,10 @@ OUT_DIR = Path("dataset/images")
 
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    cap = cv2.VideoCapture(CAM)
-    if not cap.isOpened():
-        raise RuntimeError(f"Не удалось открыть камеру {CAM}")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    # freeze=False: пусть автоматика гуляет — разный свет и баланс белого
+    # в датасете делают модель устойчивее. Разрешение то же, что в работе,
+    # чтобы YOLO училась на том же угле обзора и пропорциях кадра.
+    cap = open_cam(CAM, freeze=False)
 
     saved = len(list(OUT_DIR.glob("*.jpg")))
     auto = False
@@ -60,7 +60,7 @@ def main():
             saved += 1
             last = now
 
-        view = frame.copy()
+        view = preview(frame)
         txt = f"saved: {saved}   auto: {'ON' if auto else 'off'}"
         cv2.putText(view, txt, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)

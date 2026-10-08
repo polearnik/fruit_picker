@@ -12,10 +12,28 @@ import numpy as np
 class StereoRig:
     def __init__(self, calib_path="stereo_calib.npz"):
         c = np.load(calib_path)
+        self.calib_path = calib_path
+        self.img_size = tuple(int(v) for v in c["img_size"])
         self.K1, self.D1, self.R1, self.P1 = c["K1"], c["D1"], c["R1"], c["P1"]
         self.K2, self.D2, self.R2, self.P2 = c["K2"], c["D2"], c["R2"], c["P2"]
         # знак диспаритета зависит от порядка камер (см. историю проекта)
         self.disp_sign = -np.sign(self.P2[0, 3])
+
+    def assert_frame_size(self, width, height):
+        """Проверить, что кадры того же размера, на котором снята калибровка.
+
+        fx, fy, cx, cy — в пикселях того кадра. Другой размер (или другой
+        режим камеры, который режет кадр) — и триангуляция МОЛЧА вернёт
+        неверные миллиметры, а рука по ним поедет. Поэтому не предупреждение,
+        а остановка.
+        """
+        if self.img_size != (int(width), int(height)):
+            raise RuntimeError(
+                f"{self.calib_path} снят на {self.img_size[0]}x{self.img_size[1]}, "
+                f"а камера отдаёт {int(width)}x{int(height)}. "
+                f"Переснимите калибровку: python stereo_capture.py "
+                f"-> python stereo_calibrate.py, затем handeye_calibrate.py "
+                f"(пересчёт старой калибровки под новый кадр — CAMERA_UPGRADE.md)")
 
     def _rectify(self, pt, K, D, R, P):
         src = np.array([[pt]], dtype=np.float32)

@@ -25,30 +25,23 @@ from pathlib import Path
 
 import cv2
 
+from camera import open_pair, preview_scale
+
 # Индексы камер. Дешёвые вебки обычно занимают по два устройства,
 # поэтому вторая камера чаще всего /dev/video2, а не /dev/video1.
 # Проверить: v4l2-ctl --list-devices
 LEFT_CAM = 0
 RIGHT_CAM = 2
 
-FRAME_W, FRAME_H = 1280, 960
+# Разрешение, формат кадра и заморозка автоматики — в camera.py.
 BOARD = (9, 6)  # внутренние углы шахматной доски (столбцы, строки)
 
 OUT_DIR = Path("calib_pairs")
 
 
-def open_cam(index: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
-        raise RuntimeError(f"Не удалось открыть камеру {index}")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    return cap
-
-
 def main():
     OUT_DIR.mkdir(exist_ok=True)
-    cap_l, cap_r = open_cam(LEFT_CAM), open_cam(RIGHT_CAM)
+    cap_l, cap_r = open_pair(LEFT_CAM, RIGHT_CAM)
 
     # быстрый флаг для поиска в реальном времени
     find_flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_FAST_CHECK
@@ -68,9 +61,16 @@ def main():
         found_l, corners_l = cv2.findChessboardCorners(gray_l, BOARD, find_flags)
         found_r, corners_r = cv2.findChessboardCorners(gray_r, BOARD, find_flags)
 
-        view_l, view_r = frame_l.copy(), frame_r.copy()
-        cv2.drawChessboardCorners(view_l, BOARD, corners_l, found_l)
-        cv2.drawChessboardCorners(view_r, BOARD, corners_r, found_r)
+        # Уменьшаем ДО разметки: маркеры drawChessboardCorners фиксированного
+        # размера, на кадре 1920 px в окне они превратились бы в еле заметные
+        # точки. Углы для рисования пересчитываем тем же масштабом.
+        s = preview_scale(frame_l, frame_r)
+        view_l = cv2.resize(frame_l, None, fx=s, fy=s)
+        view_r = cv2.resize(frame_r, None, fx=s, fy=s)
+        cv2.drawChessboardCorners(view_l, BOARD,
+                                  corners_l * s if found_l else corners_l, found_l)
+        cv2.drawChessboardCorners(view_r, BOARD,
+                                  corners_r * s if found_r else corners_r, found_r)
 
         both = cv2.hconcat([view_l, view_r])
         status = f"pairs: {saved}  board: L={'+' if found_l else '-'} R={'+' if found_r else '-'}"

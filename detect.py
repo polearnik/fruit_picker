@@ -10,6 +10,8 @@
 import cv2
 from ultralytics import YOLO
 
+from camera import open_cam, overlay_scale, preview
+
 # Классы COCO, которые нас интересуют (id: имя)
 FRUIT_CLASSES = {46: "banana", 47: "apple", 49: "orange"}
 
@@ -22,9 +24,9 @@ def main():
     # При первом запуске файл модели (~6 МБ) скачается автоматически.
     model = YOLO("yolov8n.pt")
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Не удалось открыть веб-камеру (/dev/video0)")
+    # freeze=False: это демо, а не калибровка — пусть камера сама
+    # подстраивается под свет.
+    cap = open_cam(0, freeze=False)
 
     print("Камера запущена. Покажите ей банан, яблоко или апельсин.")
     print("Выход — клавиша q в окне с видео.")
@@ -35,6 +37,7 @@ def main():
             break
 
         results = model(frame, conf=CONFIDENCE, verbose=False)[0]
+        s = overlay_scale(frame)
 
         for box in results.boxes:
             cls_id = int(box.cls)
@@ -44,16 +47,16 @@ def main():
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             label = f"{FRUIT_CLASSES[cls_id]} {float(box.conf):.2f}"
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, label, (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), int(2 * s))
+            cv2.putText(frame, label, (x1, y1 - int(8 * s)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, (0, 255, 0), int(2 * s))
 
             # Центр рамки — та самая точка, к которой на этапе 2
             # мы будем запрашивать расстояние у depth-камеры
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+            cv2.circle(frame, (cx, cy), int(4 * s), (0, 0, 255), -1)
 
-        cv2.imshow("Fruit detection", frame)
+        cv2.imshow("Fruit detection", preview(frame))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 

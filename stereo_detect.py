@@ -19,9 +19,11 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from camera import FRAME_W, FRAME_H, open_pair, overlay_scale, preview
+
 LEFT_CAM = 0    # те же индексы, что в stereo_capture.py
 RIGHT_CAM = 2
-FRAME_W, FRAME_H = 1280, 960
+# Разрешение, формат кадра и заморозка автоматики — в camera.py.
 
 FRUIT_CLASSES = {46: "banana", 47: "apple", 49: "orange"}
 CONFIDENCE = 0.4
@@ -29,15 +31,6 @@ CONFIDENCE = 0.4
 # После ректификации один и тот же объект лежит на одной строке в обоих
 # кадрах. Пары детекций с большей разницей по вертикали отбрасываем.
 MAX_Y_DIFF_PX = 20
-
-
-def open_cam(index: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
-        raise RuntimeError(f"Не удалось открыть камеру {index}")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    return cap
 
 
 def detect_fruits(model, frame):
@@ -62,6 +55,12 @@ def rectify_point(pt, K, D, R_rect, P_rect):
 
 def main():
     calib = np.load("stereo_calib.npz")
+    # см. StereoRig.assert_frame_size: чужой размер кадра -> неверные мм
+    if tuple(int(v) for v in calib["img_size"]) != (FRAME_W, FRAME_H):
+        raise RuntimeError(
+            f"stereo_calib.npz снят на {calib['img_size'][0]}x{calib['img_size'][1]}, "
+            f"а камера отдаёт {FRAME_W}x{FRAME_H} — переснимите калибровку "
+            f"(stereo_capture.py -> stereo_calibrate.py)")
     K1, D1, R1, P1 = calib["K1"], calib["D1"], calib["R1"], calib["P1"]
     K2, D2, R2, P2 = calib["K2"], calib["D2"], calib["R2"], calib["P2"]
 
@@ -71,7 +70,7 @@ def main():
     disp_sign = -np.sign(P2[0, 3])
 
     model = YOLO("yolov8n.pt")
-    cap_l, cap_r = open_cam(LEFT_CAM), open_cam(RIGHT_CAM)
+    cap_l, cap_r = open_pair(LEFT_CAM, RIGHT_CAM)
     print("Покажите фрукт обеим камерам. Выход — q.")
 
     while True:
@@ -82,6 +81,7 @@ def main():
 
         dets_l = detect_fruits(model, frame_l)
         dets_r = detect_fruits(model, frame_r)
+        s = overlay_scale(frame_l, side_by_side=2)
 
         # правые детекции, ещё не связанные с левыми
         free_r = list(range(len(dets_r)))
@@ -114,15 +114,15 @@ def main():
                 color = (0, 255, 0)
                 print(f"{FRUIT_CLASSES[cls_id]}: X={X:.0f} Y={Y:.0f} Z={Z:.0f} мм")
 
-            cv2.rectangle(frame_l, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame_l, label, (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.rectangle(frame_l, (x1, y1), (x2, y2), color, int(2 * s))
+            cv2.putText(frame_l, label, (x1, y1 - int(8 * s)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6 * s, color, int(2 * s))
 
         # правый кадр показываем просто с рамками, для контроля
         for cls_id, _, (x1, y1, x2, y2) in dets_r:
-            cv2.rectangle(frame_r, (x1, y1), (x2, y2), (255, 200, 0), 2)
+            cv2.rectangle(frame_r, (x1, y1), (x2, y2), (255, 200, 0), int(2 * s))
 
-        cv2.imshow("stereo detect  L | R  (q=quit)", cv2.hconcat([frame_l, frame_r]))
+        cv2.imshow("stereo detect  L | R  (q=quit)", preview(frame_l, frame_r))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
